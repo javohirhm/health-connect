@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+.env
+health_data.db
+*.db
+
+# Large model files (>50MB) - transfer via SCP
+models/Random_Forest.pkl
