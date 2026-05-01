@@ -5,5 +5,11 @@ __pycache__/
 health_data.db
 *.db
 
+# Slide-generator leftovers (lived in the wrong directory)
+node_modules/
+progress3.js
+package.json
+package-lock.json
+
 # Large model files (>50MB) - transfer via SCP
 models/Random_Forest.pkl

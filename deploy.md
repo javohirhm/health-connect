@@ -334,23 +334,17 @@ sudo -u postgres pg_dump healthconnect | gzip > "/var/backups/healthconnect-$(da
 sudo -u postgres psql healthconnect
 ```
 
-## Known issues to be aware of
+## Operational notes
 
-1. **`save_sync` returns 0 on PostgreSQL.** [app/database.py:280-284](app/database.py:280)
-   does `cur.fetchone()["id"]` after a plain `INSERT` with no `RETURNING id`,
-   so the inserted row id is silently `0` on PG. The row is still inserted
-   correctly — only the returned id is wrong. Not a deploy blocker. Fix by
-   appending `RETURNING id` to the INSERT and reading from `cur.fetchone()`,
-   or by using `cur.lastrowid` on SQLite path only.
-
-2. **Repo bloat**: `node_modules/`, `progress3.js`, `package.json`,
-   `package-lock.json` are tracked but unrelated to the backend (came from the
-   slide generator). They make `git clone` ~7 MB heavier than necessary.
-   Cleanup is a separate task — does not affect runtime.
-
-3. **WORKERS sizing**: each uvicorn worker loads its own copy of TensorFlow
-   (~600 MB resident). Start with `WORKERS=2`. If `journalctl` shows OOM kills,
-   drop to `WORKERS=1` or upgrade RAM.
+- **WORKERS sizing**: each uvicorn worker loads its own copy of TensorFlow
+  (~600 MB resident). Start with `WORKERS=2`. If `journalctl` shows OOM kills,
+  drop to `WORKERS=1` or upgrade RAM.
+- **First-startup race on fresh DB**: with `WORKERS>1`, multiple workers can
+  run `init_db()` concurrently and one may lose a `CREATE INDEX` race. It
+  recovers (the index ends up created) and won't recur once tables exist. To
+  avoid the warning entirely on fresh installs, run
+  `python -c "from app.database import init_db; init_db()"` once before the
+  first `systemctl start`.
 
 ## Done criteria
 

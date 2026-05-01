@@ -276,11 +276,14 @@ def init_db():
 # ── Write helpers ────────────────────────────────────────────────────
 
 def save_sync(device_id: str, payload_json: str) -> int:
+    sql = "INSERT INTO sync_log (device_id, synced_at, payload) VALUES (?, ?, ?)"
+    if config.DB_TYPE == "postgresql":
+        sql += " RETURNING id"
     with get_db() as conn:
-        cur = _execute(conn, "INSERT INTO sync_log (device_id, synced_at, payload) VALUES (?, ?, ?)",
-                       (device_id, datetime.utcnow().isoformat(), payload_json))
+        cur = _execute(conn, sql, (device_id, datetime.utcnow().isoformat(), payload_json))
         if config.DB_TYPE == "postgresql":
-            return cur.fetchone()["id"] if cur.description else 0
+            row = cur.fetchone()
+            return row["id"] if row else 0
         return cur.lastrowid
 
 
