@@ -46,7 +46,11 @@ def generate_daily_insight(summary: dict) -> Optional[str]:
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {
                     "temperature": 0.7,
-                    "maxOutputTokens": 220,
+                    "maxOutputTokens": 400,
+                    # Gemini 2.5+ "thinking" eats the token budget before
+                    # producing visible output. We don't need reasoning for a
+                    # 2–3 sentence summary, so disable it.
+                    "thinkingConfig": {"thinkingBudget": 0},
                 },
             },
             timeout=TIMEOUT_SECONDS,
