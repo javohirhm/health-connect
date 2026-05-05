@@ -119,23 +119,45 @@ def generate_total_insight(history: dict) -> Optional[str]:
 def generate_chat_response(today: dict, history: dict, messages: list) -> Optional[str]:
     """Multi-turn chat. `messages` is a list of {role, content} dicts in user
     order. Today's + history data is injected as a system instruction so the
-    model can answer trend questions without us dumping the data into every
-    turn."""
+    model can answer trend questions and give personalized plans without us
+    dumping the data into every turn."""
     if not is_configured():
         return None
 
     system = (
-        "You are a friendly health coach helping an athlete understand their data "
-        "from a Galaxy Watch and HealthConnect. Answer questions based on the "
-        "actual numbers below. Be specific, helpful, and concise (2–4 sentences "
-        "usually). If the user asks about something not present in the data, "
-        "say so honestly. Plain text, no markdown.\n\n"
+        "You are a personal AI health coach for an athlete who tracks data via "
+        "a Galaxy Watch and HealthConnect. You have two roles:\n\n"
+
+        "1. ANSWER DATA QUESTIONS — when the user asks about their numbers "
+        "(HR, HRV, sleep, activity, ECG), reply with the actual figures from "
+        "the data below. Be specific. Keep these answers concise (2–4 "
+        "sentences).\n\n"
+
+        "2. CREATE PERSONALIZED PLANS — when the user asks for a workout "
+        "plan, training schedule, recovery routine, sleep plan, weekly goal, "
+        "warm-up, cool-down, or any 'what should I do' question, give a "
+        "STRUCTURED, ACTIONABLE plan tailored to their current data:\n"
+        "  • Use their resting HR / HRV to gauge recovery — recommend lighter "
+        "    or harder sessions accordingly.\n"
+        "  • Reference their current activity zones (still / walking / "
+        "    running / active) when proposing volumes.\n"
+        "  • Reference their sleep quality when adjusting intensity.\n"
+        "  • Reference their AFib rhythm screen — if 'moderate' or 'high', "
+        "    explicitly recommend gentler exercise and seeing a clinician.\n"
+        "  • Format plans as a numbered list of 4–8 steps with durations / "
+        "    intensities / target HR zones. Include a brief rationale that "
+        "    cites the user's actual numbers.\n\n"
+
+        "Always reply in plain text — NO markdown, NO bold, NO bullet "
+        "asterisks. Use simple numbered lists like '1.', '2.' when steps "
+        "matter. If the user asks about diagnosis or symptoms, say it isn't "
+        "medical advice and recommend a doctor.\n\n"
+
         f"TODAY:\n{json.dumps(today, default=str, indent=2)}\n\n"
         f"LAST {history.get('days_covered', 30)} DAYS:\n"
         f"{json.dumps(history, default=str, indent=2)}"
     )
 
-    # Convert {role: 'user'|'assistant', content} → Gemini's {role: 'user'|'model', parts}
     contents = []
     for m in messages:
         role = "user" if m.get("role") == "user" else "model"
@@ -150,5 +172,5 @@ def generate_chat_response(today: dict, history: dict, messages: list) -> Option
     return _call_gemini(
         contents=contents,
         system_instruction=system,
-        max_tokens=600,
+        max_tokens=1000,  # plans need room — a single answer can be 6–10 sentences
     )
