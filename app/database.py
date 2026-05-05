@@ -542,8 +542,9 @@ def get_today_summary(watch_id: str) -> dict:
                     bpm = s.get("bpm")
                     if isinstance(bpm, (int, float)) and bpm > 0:
                         all_bpms.append(int(bpm))
-                    # Inter-beat intervals — used for HRV. Filter to physiological range.
-                    ibis = s.get("ibi_ms")
+                    # Inter-beat intervals — accept both "ibi_ms" (snake_case)
+                    # and "ibiMs" (camelCase, default Gson on the watch).
+                    ibis = s.get("ibi_ms") or s.get("ibiMs")
                     if isinstance(ibis, list):
                         for ibi in ibis:
                             if isinstance(ibi, (int, float)) and 300 < ibi < 2000:
@@ -751,7 +752,7 @@ def get_history_summary(watch_id: str, days: int = 30) -> dict:
                     bpm = s.get("bpm")
                     if isinstance(bpm, (int, float)) and bpm > 0:
                         all_bpms.append(int(bpm))
-                    ibis = s.get("ibi_ms")
+                    ibis = s.get("ibi_ms") or s.get("ibiMs")
                     if isinstance(ibis, list):
                         for ibi in ibis:
                             if isinstance(ibi, (int, float)) and 300 < ibi < 2000:
@@ -851,6 +852,55 @@ def get_history_summary(watch_id: str, days: int = 30) -> dict:
 
 
 # ── AI insights cache ─────────────────────────────────────────────────
+
+def get_sleep_history(watch_id: str, limit: int = 14) -> list[dict]:
+    """Recent sleep sessions for the device paired with this watch, each
+    augmented with a restlessness analysis from accelerometer batches inside
+    the session window."""
+    from .signal_analysis import analyze_sleep_restlessness
+
+    with get_db() as conn:
+        dev_row = _fetchone(conn,
+            "SELECT device_id FROM watch_sensor_data "
+            "WHERE watch_id = ? ORDER BY id DESC LIMIT 1",
+            (watch_id,))
+        if not dev_row:
+            return []
+
+        sessions = _fetchall(conn,
+            "SELECT id, start_time, end_time FROM sleep_sessions "
+            "WHERE device_id = ? ORDER BY start_time DESC LIMIT ?",
+            (dev_row["device_id"], limit))
+
+        results: list[dict] = []
+        for s in sessions:
+            try:
+                start = datetime.fromisoformat(s["start_time"].replace("Z", "+00:00"))
+                end = datetime.fromisoformat(s["end_time"].replace("Z", "+00:00"))
+                duration_h = round((end - start).total_seconds() / 3600, 1)
+
+                start_sql = (start.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+                             if start.tzinfo else start.strftime("%Y-%m-%d %H:%M:%S"))
+                end_sql = (end.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+                           if end.tzinfo else end.strftime("%Y-%m-%d %H:%M:%S"))
+                accel = _fetchall(conn,
+                    "SELECT data_json FROM watch_sensor_data "
+                    "WHERE watch_id = ? AND sensor_type = 'accelerometer' "
+                    "AND created_at >= ? AND created_at <= ?",
+                    (watch_id, start_sql, end_sql))
+
+                results.append({
+                    "id": s["id"],
+                    "start_time": s["start_time"],
+                    "end_time": s["end_time"],
+                    "duration_hours": duration_h,
+                    "restlessness": analyze_sleep_restlessness(accel) if accel else None,
+                })
+            except (ValueError, AttributeError, KeyError):
+                continue
+
+        return results
+
 
 def get_cached_insight(watch_id: str, date: str) -> dict | None:
     """Look up a previously-generated AI insight for (watch_id, date)."""

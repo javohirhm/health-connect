@@ -215,6 +215,13 @@ def get_watch_summary(watch_id: str):
     return db.get_watch_summary(watch_id)
 
 
+@app.get("/api/v2/watch/{watch_id}/sleep/history")
+def get_watch_sleep_history(watch_id: str, limit: int = 14):
+    """Recent sleep sessions for this watch's device, each with a restlessness
+    analysis (quality_score, restless_minutes) computed from overnight accel."""
+    return db.get_sleep_history(watch_id, limit)
+
+
 @app.get("/api/v2/watch/{watch_id}/summary/today")
 def get_watch_today_summary(watch_id: str):
     """Today's rollup: HR stats (incl. HRV), activity zones, SpO2/ECG, sleep."""
