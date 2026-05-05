@@ -129,6 +129,12 @@ def get_watch_summary(watch_id: str):
     return db.get_watch_summary(watch_id)
 
 
+@app.get("/api/v2/watch/{watch_id}/summary/today")
+def get_watch_today_summary(watch_id: str):
+    """Today's rollup: HR stats, activity, latest SpO2/ECG, last sleep."""
+    return db.get_today_summary(watch_id)
+
+
 @app.get("/api/v2/watch/{watch_id}/data")
 def get_watch_data(watch_id: str, sensor_type: str = None, limit: int = 50):
     return db.get_watch_sensor_data(watch_id, sensor_type, limit)

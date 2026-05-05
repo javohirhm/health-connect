@@ -482,6 +482,137 @@ def get_all_watches() -> list[dict]:
             "FROM watch_sensor_data GROUP BY watch_id ORDER BY last_seen DESC")
 
 
+def get_today_summary(watch_id: str) -> dict:
+    """Roll up today's metrics for a watch (UTC day boundary).
+
+    Aggregates HR samples across all batches today, accel batch count as a
+    wear-time proxy, latest SpO2, ECG count + latest classification, and the
+    most recent sleep session for the device that owns this watch. Each
+    section is `null` when no data exists for that sensor today.
+    """
+    today_start = datetime.utcnow().replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).strftime("%Y-%m-%d %H:%M:%S")
+
+    with get_db() as conn:
+        # ── Heart rate ───────────────────────────────────────────────
+        hr_rows = _fetchall(conn,
+            "SELECT data_json FROM watch_sensor_data "
+            "WHERE watch_id = ? AND sensor_type = 'heart_rate' AND created_at >= ?",
+            (watch_id, today_start))
+
+        all_bpms: list[int] = []
+        for r in hr_rows:
+            try:
+                payload = json.loads(r["data_json"])
+                for s in payload.get("samples", []):
+                    bpm = s.get("bpm")
+                    if isinstance(bpm, (int, float)) and bpm > 0:
+                        all_bpms.append(int(bpm))
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        hr_summary = None
+        if all_bpms:
+            sorted_bpms = sorted(all_bpms)
+            resting_n = max(1, len(sorted_bpms) // 10)
+            resting = sum(sorted_bpms[:resting_n]) // resting_n
+            hr_summary = {
+                "avg_bpm": sum(all_bpms) // len(all_bpms),
+                "min_bpm": min(all_bpms),
+                "max_bpm": max(all_bpms),
+                "resting_bpm": resting,
+                "samples": len(all_bpms),
+            }
+
+        # ── Activity (accelerometer batches as wear-time proxy) ──────
+        accel_row = _fetchone(conn,
+            "SELECT COUNT(*) as c FROM watch_sensor_data "
+            "WHERE watch_id = ? AND sensor_type = 'accelerometer' AND created_at >= ?",
+            (watch_id, today_start))
+        activity_summary = None
+        if accel_row and accel_row["c"] > 0:
+            batches = accel_row["c"]
+            # Each batch ~125 samples at ~25Hz → ~5 seconds of data
+            activity_summary = {
+                "accel_batches": batches,
+                "wear_time_estimate_min": round(batches * 5 / 60),
+            }
+
+        # ── Latest SpO2 ──────────────────────────────────────────────
+        spo2_row = _fetchone(conn,
+            "SELECT data_json, created_at FROM watch_sensor_data "
+            "WHERE watch_id = ? AND sensor_type = 'spo2' AND created_at >= ? "
+            "ORDER BY id DESC LIMIT 1",
+            (watch_id, today_start))
+        spo2_summary = None
+        if spo2_row:
+            try:
+                data = json.loads(spo2_row["data_json"])
+                spo2_summary = {
+                    "latest_percent": data.get("spO2Percent", 0),
+                    "recorded_at": spo2_row["created_at"],
+                }
+            except json.JSONDecodeError:
+                pass
+
+        # ── ECG count + latest classification ────────────────────────
+        ecg_count_row = _fetchone(conn,
+            "SELECT COUNT(*) as c FROM watch_sensor_data "
+            "WHERE watch_id = ? AND sensor_type = 'ecg' AND created_at >= ?",
+            (watch_id, today_start))
+        ecg_summary = None
+        if ecg_count_row and ecg_count_row["c"] > 0:
+            latest = _fetchone(conn,
+                "SELECT id FROM watch_sensor_data "
+                "WHERE watch_id = ? AND sensor_type = 'ecg' AND created_at >= ? "
+                "ORDER BY id DESC LIMIT 1",
+                (watch_id, today_start))
+            label = None
+            if latest:
+                cls_row = _fetchone(conn,
+                    "SELECT predicted_class FROM ecg_classifications "
+                    "WHERE ecg_record_id = ? ORDER BY id DESC LIMIT 1",
+                    (latest["id"],))
+                label = cls_row["predicted_class"] if cls_row else None
+            ecg_summary = {
+                "recordings": ecg_count_row["c"],
+                "latest_status": label or "Not analyzed",
+            }
+
+        # ── Last sleep session (Health Connect, keyed by device_id) ──
+        dev_row = _fetchone(conn,
+            "SELECT device_id FROM watch_sensor_data WHERE watch_id = ? ORDER BY id DESC LIMIT 1",
+            (watch_id,))
+        sleep_summary = None
+        if dev_row:
+            sleep_row = _fetchone(conn,
+                "SELECT start_time, end_time FROM sleep_sessions "
+                "WHERE device_id = ? ORDER BY id DESC LIMIT 1",
+                (dev_row["device_id"],))
+            if sleep_row:
+                try:
+                    start = datetime.fromisoformat(sleep_row["start_time"].replace("Z", "+00:00"))
+                    end = datetime.fromisoformat(sleep_row["end_time"].replace("Z", "+00:00"))
+                    duration_h = round((end - start).total_seconds() / 3600, 1)
+                    sleep_summary = {
+                        "duration_hours": duration_h,
+                        "started_at": sleep_row["start_time"],
+                    }
+                except (ValueError, AttributeError):
+                    pass
+
+    return {
+        "watch_id": watch_id,
+        "date": today_start[:10],
+        "heart_rate": hr_summary,
+        "activity": activity_summary,
+        "spo2": spo2_summary,
+        "ecg": ecg_summary,
+        "sleep": sleep_summary,
+    }
+
+
 def get_all_data_for_device(device_id: str) -> dict:
     """Get all data for a device — used for PDF reports and CSV export."""
     with get_db() as conn:
