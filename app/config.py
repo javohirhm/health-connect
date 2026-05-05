@@ -36,7 +36,7 @@ class Config:
 
     # Gemini AI (optional — leave blank to disable AI insights)
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
     @property
     def pg_url(self) -> str:

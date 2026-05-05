@@ -181,7 +181,7 @@ CREATE TABLE IF NOT EXISTS ai_insights (
     date        TEXT NOT NULL,
     summary_json TEXT NOT NULL,
     ai_text     TEXT NOT NULL,
-    model       TEXT NOT NULL DEFAULT 'gemini-1.5-flash',
+    model       TEXT NOT NULL DEFAULT 'gemini-2.5-flash',
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(watch_id, date)
 );
@@ -276,7 +276,7 @@ CREATE TABLE IF NOT EXISTS ai_insights (
     date        TEXT NOT NULL,
     summary_json TEXT NOT NULL,
     ai_text     TEXT NOT NULL,
-    model       TEXT NOT NULL DEFAULT 'gemini-1.5-flash',
+    model       TEXT NOT NULL DEFAULT 'gemini-2.5-flash',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(watch_id, date)
 );
