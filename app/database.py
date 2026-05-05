@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import contextmanager
 from typing import Optional
 from .config import config
@@ -712,6 +712,125 @@ def get_all_watch_data(watch_id: str) -> dict:
             grouped[st] = []
         grouped[st].append(r)
     return grouped
+
+
+# ── History summary (last N days) — used as Gemini chat context ───────
+
+def get_history_summary(watch_id: str, days: int = 30) -> dict:
+    """Compact aggregate of the last `days` of data for this watch.
+
+    Used as background context in `/insights/total` and `/chat` so Gemini can
+    answer trend questions ("how's my HRV been this month?"). Compact dict —
+    not every sample, just averages.
+    """
+    start = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+
+    with get_db() as conn:
+        # ── HR + HRV across the window ───────────────────────────────
+        hr_rows = _fetchall(conn,
+            "SELECT data_json FROM watch_sensor_data "
+            "WHERE watch_id = ? AND sensor_type = 'heart_rate' AND created_at >= ?",
+            (watch_id, start))
+
+        all_bpms: list[int] = []
+        all_ibis: list[int] = []
+        for r in hr_rows:
+            try:
+                payload = json.loads(r["data_json"])
+                for s in payload.get("samples", []):
+                    bpm = s.get("bpm")
+                    if isinstance(bpm, (int, float)) and bpm > 0:
+                        all_bpms.append(int(bpm))
+                    ibis = s.get("ibi_ms")
+                    if isinstance(ibis, list):
+                        for ibi in ibis:
+                            if isinstance(ibi, (int, float)) and 300 < ibi < 2000:
+                                all_ibis.append(int(ibi))
+                    elif isinstance(ibis, (int, float)) and 300 < ibis < 2000:
+                        all_ibis.append(int(ibis))
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        avg_hr = sum(all_bpms) // len(all_bpms) if all_bpms else None
+
+        avg_hrv = None
+        if len(all_ibis) >= 2:
+            diffs = [all_ibis[i + 1] - all_ibis[i] for i in range(len(all_ibis) - 1)]
+            if diffs:
+                avg_hrv = round((sum(d * d for d in diffs) / len(diffs)) ** 0.5, 1)
+
+        # ── Wear-time proxy (accel batch count) ──────────────────────
+        accel_count = _fetchone(conn,
+            "SELECT COUNT(*) as c FROM watch_sensor_data "
+            "WHERE watch_id = ? AND sensor_type = 'accelerometer' AND created_at >= ?",
+            (watch_id, start))["c"]
+        avg_wear_min_per_day = round(accel_count * 5 / 60 / max(1, days)) if accel_count else 0
+
+        # ── ECG counts + classification distribution ─────────────────
+        ecg_count = _fetchone(conn,
+            "SELECT COUNT(*) as c FROM watch_sensor_data "
+            "WHERE watch_id = ? AND sensor_type = 'ecg' AND created_at >= ?",
+            (watch_id, start))["c"]
+
+        ecg_classes: dict = {}
+        if ecg_count > 0:
+            class_rows = _fetchall(conn,
+                "SELECT predicted_class, COUNT(*) as c FROM ecg_classifications "
+                "WHERE watch_id = ? AND created_at >= ? GROUP BY predicted_class",
+                (watch_id, start))
+            for r in class_rows:
+                ecg_classes[r["predicted_class"]] = r["c"]
+
+        # ── Sleep history ────────────────────────────────────────────
+        dev_row = _fetchone(conn,
+            "SELECT device_id FROM watch_sensor_data WHERE watch_id = ? ORDER BY id DESC LIMIT 1",
+            (watch_id,))
+        avg_sleep = None
+        sleep_count = 0
+        if dev_row:
+            sleep_rows = _fetchall(conn,
+                "SELECT start_time, end_time FROM sleep_sessions "
+                "WHERE device_id = ? AND start_time >= ?",
+                (dev_row["device_id"], start.split()[0]))
+            durations = []
+            for r in sleep_rows:
+                try:
+                    s = datetime.fromisoformat(r["start_time"].replace("Z", "+00:00"))
+                    e = datetime.fromisoformat(r["end_time"].replace("Z", "+00:00"))
+                    h = (e - s).total_seconds() / 3600
+                    if 0 < h < 24:
+                        durations.append(h)
+                except (ValueError, AttributeError):
+                    continue
+            if durations:
+                avg_sleep = round(sum(durations) / len(durations), 1)
+                sleep_count = len(durations)
+
+        # ── Latest SpO2 in the window ────────────────────────────────
+        spo2_row = _fetchone(conn,
+            "SELECT data_json FROM watch_sensor_data "
+            "WHERE watch_id = ? AND sensor_type = 'spo2' AND created_at >= ? "
+            "ORDER BY id DESC LIMIT 1",
+            (watch_id, start))
+        latest_spo2 = None
+        if spo2_row:
+            try:
+                latest_spo2 = json.loads(spo2_row["data_json"]).get("spO2Percent")
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    return {
+        "watch_id": watch_id,
+        "days_covered": days,
+        "avg_hr_bpm": avg_hr,
+        "avg_hrv_rmssd_ms": avg_hrv,
+        "avg_wear_min_per_day": avg_wear_min_per_day,
+        "ecg_recordings": ecg_count,
+        "ecg_classifications": ecg_classes,
+        "avg_sleep_hours": avg_sleep,
+        "sleep_sessions_logged": sleep_count,
+        "latest_spo2_percent": latest_spo2,
+    }
 
 
 # ── AI insights cache ─────────────────────────────────────────────────

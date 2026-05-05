@@ -21,6 +21,7 @@ from .config import config
 from .models import (
     HealthDataPayload, SyncResponse, DeviceSummary, HealthSummary,
     WatchSensorPayload, WatchSyncResponse,
+    ChatRequest, ChatResponse,
 )
 from . import database as db
 from . import gemini
@@ -134,6 +135,80 @@ def get_watch_summary(watch_id: str):
 def get_watch_today_summary(watch_id: str):
     """Today's rollup: HR stats (incl. HRV), activity zones, SpO2/ECG, sleep."""
     return db.get_today_summary(watch_id)
+
+
+@app.get("/api/v2/watch/{watch_id}/insights/total")
+def get_watch_total_insight(watch_id: str, days: int = 30):
+    """Holistic AI summary of the last `days` of data, cached daily."""
+    today_date = datetime.utcnow().strftime("%Y-%m-%d")
+    cache_key = f"total:{today_date}"
+
+    cached = db.get_cached_insight(watch_id, cache_key)
+    if cached:
+        return cached
+
+    if not gemini.is_configured():
+        return {
+            "ai_text": "AI insights are not configured. Set GEMINI_API_KEY in the backend .env to enable.",
+            "model": "",
+            "generated_at": "",
+            "cached": False,
+            "disabled": True,
+        }
+
+    history = db.get_history_summary(watch_id, days=days)
+    if not history.get("avg_hr_bpm") and not history.get("ecg_recordings") and not history.get("avg_sleep_hours"):
+        return {
+            "ai_text": "Not enough history yet — keep wearing the watch and check back in a few days.",
+            "model": config.GEMINI_MODEL,
+            "generated_at": "",
+            "cached": False,
+            "disabled": False,
+        }
+
+    text = gemini.generate_total_insight(history)
+    if not text:
+        return {
+            "ai_text": "Couldn't reach the AI service right now. Try again in a minute.",
+            "model": config.GEMINI_MODEL,
+            "generated_at": "",
+            "cached": False,
+            "error": True,
+        }
+
+    db.save_insight(watch_id, cache_key, json.dumps(history, default=str), text, config.GEMINI_MODEL)
+    return {
+        "ai_text": text,
+        "model": config.GEMINI_MODEL,
+        "generated_at": "",
+        "cached": False,
+    }
+
+
+@app.post("/api/v2/watch/{watch_id}/chat", response_model=ChatResponse)
+def chat_with_ai(watch_id: str, body: ChatRequest):
+    """Multi-turn chat with Gemini, with the user's data injected as context.
+    Stateless — the client is expected to send the full message history each
+    turn. We don't persist conversations; each call is independent."""
+    if not gemini.is_configured():
+        return ChatResponse(
+            content="AI chat is not configured. Set GEMINI_API_KEY in the backend .env to enable.",
+        )
+
+    today = db.get_today_summary(watch_id)
+    history = db.get_history_summary(watch_id, days=30)
+
+    # Pydantic models → plain dicts for the gemini helper
+    msgs = [{"role": m.role, "content": m.content} for m in body.messages]
+
+    text = gemini.generate_chat_response(today, history, msgs)
+    if not text:
+        return ChatResponse(
+            content="Sorry, the AI couldn't be reached right now. Try again in a minute.",
+            model=config.GEMINI_MODEL,
+        )
+
+    return ChatResponse(content=text, model=config.GEMINI_MODEL)
 
 
 @app.get("/api/v2/watch/{watch_id}/insights/ai")

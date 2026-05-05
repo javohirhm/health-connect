@@ -94,3 +94,20 @@ class WatchSyncResponse(BaseModel):
     success: bool = True
     message: str = "Watch data received"
     records_saved: int = 0
+
+
+# ── AI chat ──────────────────────────────────────────────────────────
+
+class ChatTurn(BaseModel):
+    role: str = Field(..., description="'user' or 'assistant'")
+    content: str = Field(..., min_length=1)
+
+
+class ChatRequest(BaseModel):
+    messages: list[ChatTurn] = Field(..., min_length=1)
+
+
+class ChatResponse(BaseModel):
+    role: str = "assistant"
+    content: str
+    model: str = ""
