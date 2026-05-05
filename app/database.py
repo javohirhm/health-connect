@@ -394,11 +394,17 @@ def save_exercise_sessions(device_id: str, records: list[dict]) -> int:
 
 
 def save_watch_sensor_data(device_id: str, watch_id: str, sensor_type: str, data_json: str) -> int:
+    """Insert a watch sensor row and return the new row id (so the caller can
+    schedule per-row work like ECG classification)."""
+    sql = "INSERT INTO watch_sensor_data (device_id, watch_id, sensor_type, data_json) VALUES (?, ?, ?, ?)"
+    if config.DB_TYPE == "postgresql":
+        sql += " RETURNING id"
     with get_db() as conn:
-        _execute(conn,
-            "INSERT INTO watch_sensor_data (device_id, watch_id, sensor_type, data_json) VALUES (?, ?, ?, ?)",
-            (device_id, watch_id, sensor_type, data_json))
-        return 1
+        cur = _execute(conn, sql, (device_id, watch_id, sensor_type, data_json))
+        if config.DB_TYPE == "postgresql":
+            row = cur.fetchone()
+            return row["id"] if row else 0
+        return cur.lastrowid or 0
 
 
 def save_ecg_classification(ecg_record_id: int, watch_id: str, model_name: str,

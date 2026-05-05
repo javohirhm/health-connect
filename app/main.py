@@ -13,7 +13,7 @@ import io
 import json
 import logging
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 
@@ -111,14 +111,98 @@ def health_check():
 # V2: Galaxy Watch Sensor Data
 # ═══════════════════════════════════════════════════════════════════════
 
+DEFAULT_ECG_MODEL = "XGBoost"  # 1D-CNN flagged as keras-version-fragile in the deploy notes
+
+
+def _classify_ecg_in_background(record_id: int, watch_id: str, data_json: str) -> None:
+    """Run ML classification on a freshly-saved ECG and persist the results.
+
+    Invoked via FastAPI BackgroundTasks so /watch/sync stays fast — the watch
+    POSTs the ECG, gets a ~10ms response, and classification runs after.
+    """
+    try:
+        from .ml_classifier import classify_ecg
+        data = json.loads(data_json)
+        samples = data.get("samplesMillivolts", [])
+        sample_rate = data.get("sampleRateHz", 500)
+
+        result = classify_ecg(samples, sample_rate, DEFAULT_ECG_MODEL)
+        if "error" in result:
+            logger.warning("Auto-classify failed for record %s: %s", record_id, result["error"])
+            return
+
+        beats = result.get("classifications", [])
+        for c in beats:
+            db.save_ecg_classification(
+                ecg_record_id=record_id, watch_id=watch_id, model_name=DEFAULT_ECG_MODEL,
+                beat_index=c["beat_index"], predicted_class=c["class"],
+                confidence=c["confidence"], all_probabilities=c["probabilities"])
+        logger.info("Auto-classified ECG record %s: %d beats", record_id, len(beats))
+    except Exception as e:
+        logger.error("Auto-classify error for record %s: %s", record_id, e, exc_info=True)
+
+
 @app.post("/api/v2/watch/sync", response_model=WatchSyncResponse)
-def sync_watch_data(payload: WatchSensorPayload):
+def sync_watch_data(payload: WatchSensorPayload, background: BackgroundTasks):
     logger.info("Watch sync: device=%s watch=%s sensor=%s",
         payload.device_id, payload.watch_id, payload.sensor_type)
-    saved = db.save_watch_sensor_data(
+    record_id = db.save_watch_sensor_data(
         device_id=payload.device_id, watch_id=payload.watch_id,
         sensor_type=payload.sensor_type, data_json=payload.data_json)
-    return WatchSyncResponse(records_saved=saved)
+
+    # Trigger ML classification for new ECG recordings. Runs after the
+    # response is returned so sync stays fast.
+    if payload.sensor_type == "ecg" and record_id > 0:
+        background.add_task(
+            _classify_ecg_in_background, record_id, payload.watch_id, payload.data_json,
+        )
+
+    return WatchSyncResponse(records_saved=1)
+
+
+@app.post("/api/v2/watch/{watch_id}/ecg/classify-pending")
+def classify_pending_ecgs(watch_id: str, model: str = Query(DEFAULT_ECG_MODEL)):
+    """One-shot backfill: classify every ECG for this watch that hasn't been
+    classified yet. Useful right after deploying the auto-classify change so
+    pre-existing recordings get a status."""
+    from .ml_classifier import classify_ecg
+
+    with db.get_db() as conn:
+        rows = db._fetchall(conn,
+            "SELECT wsd.id as id, wsd.data_json as data_json "
+            "FROM watch_sensor_data wsd "
+            "WHERE wsd.watch_id = ? AND wsd.sensor_type = 'ecg' "
+            "AND NOT EXISTS (SELECT 1 FROM ecg_classifications ec WHERE ec.ecg_record_id = wsd.id)",
+            (watch_id,))
+
+    classified = 0
+    failed: list[dict] = []
+    for r in rows:
+        try:
+            data = json.loads(r["data_json"])
+            samples = data.get("samplesMillivolts", [])
+            sample_rate = data.get("sampleRateHz", 500)
+            result = classify_ecg(samples, sample_rate, model)
+            if "error" in result:
+                failed.append({"record_id": r["id"], "error": result["error"]})
+                continue
+            for c in result["classifications"]:
+                db.save_ecg_classification(
+                    ecg_record_id=r["id"], watch_id=watch_id, model_name=model,
+                    beat_index=c["beat_index"], predicted_class=c["class"],
+                    confidence=c["confidence"], all_probabilities=c["probabilities"])
+            classified += 1
+        except Exception as e:
+            logger.error("Backfill error for record %s: %s", r["id"], e, exc_info=True)
+            failed.append({"record_id": r["id"], "error": str(e)})
+
+    return {
+        "watch_id": watch_id,
+        "model": model,
+        "pending_found": len(rows),
+        "classified": classified,
+        "failed": failed,
+    }
 
 
 @app.get("/api/v2/watches")
@@ -369,7 +453,7 @@ def get_watch_latest_skin_temp(watch_id: str):
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.post("/api/v2/watch/{watch_id}/ecg/{record_id}/classify")
-def classify_ecg_recording(watch_id: str, record_id: int, model: str = Query("1D-CNN")):
+def classify_ecg_recording(watch_id: str, record_id: int, model: str = Query(DEFAULT_ECG_MODEL)):
     """Run arrhythmia classification on a stored ECG recording."""
     from .ml_classifier import classify_ecg
 
