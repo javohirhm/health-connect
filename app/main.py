@@ -23,6 +23,7 @@ from .models import (
     WatchSensorPayload, WatchSyncResponse,
 )
 from . import database as db
+from . import gemini
 
 logging.basicConfig(level=getattr(logging, config.LOG_LEVEL), format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("health-api")
@@ -131,8 +132,59 @@ def get_watch_summary(watch_id: str):
 
 @app.get("/api/v2/watch/{watch_id}/summary/today")
 def get_watch_today_summary(watch_id: str):
-    """Today's rollup: HR stats, activity, latest SpO2/ECG, last sleep."""
+    """Today's rollup: HR stats (incl. HRV), activity zones, SpO2/ECG, sleep."""
     return db.get_today_summary(watch_id)
+
+
+@app.get("/api/v2/watch/{watch_id}/insights/ai")
+def get_watch_ai_insight(watch_id: str):
+    """Natural-language summary of today's data via Gemini, cached by date."""
+    summary = db.get_today_summary(watch_id)
+    date = summary["date"]
+
+    # Cache hit?
+    cached = db.get_cached_insight(watch_id, date)
+    if cached:
+        return cached
+
+    # Gemini disabled?
+    if not gemini.is_configured():
+        return {
+            "ai_text": "AI insights are not configured. Set GEMINI_API_KEY in the backend .env to enable.",
+            "model": "",
+            "generated_at": "",
+            "cached": False,
+            "disabled": True,
+        }
+
+    # Don't bother calling Gemini if there's nothing to summarize.
+    has_data = any(summary.get(k) for k in ("heart_rate", "activity", "spo2", "ecg", "sleep"))
+    if not has_data:
+        return {
+            "ai_text": "No data yet today — start the watch tracker and check back.",
+            "model": config.GEMINI_MODEL,
+            "generated_at": "",
+            "cached": False,
+            "disabled": False,
+        }
+
+    text = gemini.generate_daily_insight(summary)
+    if not text:
+        return {
+            "ai_text": "Couldn't reach the AI service right now. Try again in a minute.",
+            "model": config.GEMINI_MODEL,
+            "generated_at": "",
+            "cached": False,
+            "error": True,
+        }
+
+    db.save_insight(watch_id, date, json.dumps(summary, default=str), text, config.GEMINI_MODEL)
+    return {
+        "ai_text": text,
+        "model": config.GEMINI_MODEL,
+        "generated_at": "",
+        "cached": False,
+    }
 
 
 @app.get("/api/v2/watch/{watch_id}/data")

@@ -174,6 +174,19 @@ CREATE TABLE IF NOT EXISTS ecg_classifications (
 
 CREATE INDEX IF NOT EXISTS idx_ecg_class_record ON ecg_classifications(ecg_record_id);
 CREATE INDEX IF NOT EXISTS idx_ecg_class_watch ON ecg_classifications(watch_id);
+
+CREATE TABLE IF NOT EXISTS ai_insights (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    watch_id    TEXT NOT NULL,
+    date        TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
+    ai_text     TEXT NOT NULL,
+    model       TEXT NOT NULL DEFAULT 'gemini-1.5-flash',
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(watch_id, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_insights_watch ON ai_insights(watch_id, date);
 """
 
 _PG_SCHEMA = """
@@ -256,6 +269,19 @@ CREATE TABLE IF NOT EXISTS ecg_classifications (
 
 CREATE INDEX IF NOT EXISTS idx_ecg_class_record ON ecg_classifications(ecg_record_id);
 CREATE INDEX IF NOT EXISTS idx_ecg_class_watch ON ecg_classifications(watch_id);
+
+CREATE TABLE IF NOT EXISTS ai_insights (
+    id          SERIAL PRIMARY KEY,
+    watch_id    TEXT NOT NULL,
+    date        TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
+    ai_text     TEXT NOT NULL,
+    model       TEXT NOT NULL DEFAULT 'gemini-1.5-flash',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(watch_id, date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_insights_watch ON ai_insights(watch_id, date);
 """
 
 
@@ -502,6 +528,7 @@ def get_today_summary(watch_id: str) -> dict:
             (watch_id, today_start))
 
         all_bpms: list[int] = []
+        all_ibis: list[int] = []
         for r in hr_rows:
             try:
                 payload = json.loads(r["data_json"])
@@ -509,6 +536,14 @@ def get_today_summary(watch_id: str) -> dict:
                     bpm = s.get("bpm")
                     if isinstance(bpm, (int, float)) and bpm > 0:
                         all_bpms.append(int(bpm))
+                    # Inter-beat intervals — used for HRV. Filter to physiological range.
+                    ibis = s.get("ibi_ms")
+                    if isinstance(ibis, list):
+                        for ibi in ibis:
+                            if isinstance(ibi, (int, float)) and 300 < ibi < 2000:
+                                all_ibis.append(int(ibi))
+                    elif isinstance(ibis, (int, float)) and 300 < ibis < 2000:
+                        all_ibis.append(int(ibis))
             except (json.JSONDecodeError, TypeError):
                 continue
 
@@ -517,26 +552,66 @@ def get_today_summary(watch_id: str) -> dict:
             sorted_bpms = sorted(all_bpms)
             resting_n = max(1, len(sorted_bpms) // 10)
             resting = sum(sorted_bpms[:resting_n]) // resting_n
+
+            # HRV — RMSSD: root mean square of successive IBI differences.
+            # Higher RMSSD generally indicates better recovery / parasympathetic tone.
+            hrv_rmssd = None
+            if len(all_ibis) >= 2:
+                diffs = [all_ibis[i + 1] - all_ibis[i] for i in range(len(all_ibis) - 1)]
+                if diffs:
+                    hrv_rmssd = round((sum(d * d for d in diffs) / len(diffs)) ** 0.5, 1)
+
             hr_summary = {
                 "avg_bpm": sum(all_bpms) // len(all_bpms),
                 "min_bpm": min(all_bpms),
                 "max_bpm": max(all_bpms),
                 "resting_bpm": resting,
                 "samples": len(all_bpms),
+                "hrv_rmssd_ms": hrv_rmssd,
             }
 
-        # ── Activity (accelerometer batches as wear-time proxy) ──────
-        accel_row = _fetchone(conn,
-            "SELECT COUNT(*) as c FROM watch_sensor_data "
+        # ── Activity zones from accelerometer ────────────────────────
+        accel_rows = _fetchall(conn,
+            "SELECT data_json FROM watch_sensor_data "
             "WHERE watch_id = ? AND sensor_type = 'accelerometer' AND created_at >= ?",
             (watch_id, today_start))
         activity_summary = None
-        if accel_row and accel_row["c"] > 0:
-            batches = accel_row["c"]
-            # Each batch ~125 samples at ~25Hz → ~5 seconds of data
+        if accel_rows:
+            zones_sec = {"rest": 0, "light": 0, "moderate": 0, "intense": 0}
+            for r in accel_rows:
+                try:
+                    payload = json.loads(r["data_json"])
+                    samples = payload.get("samples", [])
+                    if len(samples) < 2:
+                        continue
+                    # Compute per-sample magnitude, then std-dev across the batch.
+                    # Std-dev is unit-relative (works for m/s² or g): low when still,
+                    # high during motion. Each batch ≈ 5 seconds of data.
+                    mags = []
+                    for s in samples:
+                        x = float(s.get("x", 0) or 0)
+                        y = float(s.get("y", 0) or 0)
+                        z = float(s.get("z", 0) or 0)
+                        mags.append((x * x + y * y + z * z) ** 0.5)
+                    mean = sum(mags) / len(mags)
+                    var = sum((m - mean) ** 2 for m in mags) / len(mags)
+                    sd = var ** 0.5
+                    if sd < 0.5:
+                        zones_sec["rest"] += 5
+                    elif sd < 2.0:
+                        zones_sec["light"] += 5
+                    elif sd < 5.0:
+                        zones_sec["moderate"] += 5
+                    else:
+                        zones_sec["intense"] += 5
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+            batches = len(accel_rows)
             activity_summary = {
                 "accel_batches": batches,
                 "wear_time_estimate_min": round(batches * 5 / 60),
+                "zones_min": {k: round(v / 60) for k, v in zones_sec.items()},
             }
 
         # ── Latest SpO2 ──────────────────────────────────────────────
@@ -637,3 +712,43 @@ def get_all_watch_data(watch_id: str) -> dict:
             grouped[st] = []
         grouped[st].append(r)
     return grouped
+
+
+# ── AI insights cache ─────────────────────────────────────────────────
+
+def get_cached_insight(watch_id: str, date: str) -> dict | None:
+    """Look up a previously-generated AI insight for (watch_id, date)."""
+    with get_db() as conn:
+        row = _fetchone(conn,
+            "SELECT ai_text, model, created_at FROM ai_insights "
+            "WHERE watch_id = ? AND date = ?",
+            (watch_id, date))
+    if not row:
+        return None
+    return {
+        "ai_text": row["ai_text"],
+        "model": row["model"],
+        "generated_at": str(row["created_at"]),
+        "cached": True,
+    }
+
+
+def save_insight(watch_id: str, date: str, summary_json: str, ai_text: str, model: str) -> None:
+    """Persist (or refresh) the AI insight for (watch_id, date)."""
+    with get_db() as conn:
+        if config.DB_TYPE == "postgresql":
+            _execute(conn,
+                "INSERT INTO ai_insights (watch_id, date, summary_json, ai_text, model) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT (watch_id, date) DO UPDATE SET "
+                "summary_json = EXCLUDED.summary_json, "
+                "ai_text = EXCLUDED.ai_text, "
+                "model = EXCLUDED.model, "
+                "created_at = NOW()",
+                (watch_id, date, summary_json, ai_text, model))
+        else:
+            _execute(conn,
+                "INSERT OR REPLACE INTO ai_insights "
+                "(watch_id, date, summary_json, ai_text, model) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (watch_id, date, summary_json, ai_text, model))
