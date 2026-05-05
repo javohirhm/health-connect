@@ -14,6 +14,8 @@ from .config import config
 
 logger = logging.getLogger("health-api.ml")
 
+import math
+
 CLASS_NAMES = ["N", "S", "V", "F", "Q"]
 CLASS_DESCRIPTIONS = {
     "N": "Normal",
@@ -43,16 +45,9 @@ def _load_models():
         logger.warning("Models directory not found: %s", models_dir)
         return
 
-    # Load 1D-CNN (best performer at 98.28%)
-    cnn_path = models_dir / "1D_CNN.keras"
-    if cnn_path.exists():
-        try:
-            import tensorflow as tf
-            tf.get_logger().setLevel("ERROR")
-            _models["1D-CNN"] = tf.keras.models.load_model(str(cnn_path))
-            logger.info("Loaded 1D-CNN model")
-        except Exception as e:
-            logger.warning("Failed to load 1D-CNN: %s", e)
+    # 1D-CNN and CNN-LSTM keras models are intentionally NOT loaded:
+    # SVM (98.24%) and XGBoost (98.18%) match their accuracy without
+    # carrying TensorFlow's ~600 MB-per-worker memory footprint.
 
     # Load XGBoost
     xgb_path = models_dir / "XGBoost.pkl"
@@ -194,8 +189,111 @@ def _extract_features(beat: np.ndarray) -> np.ndarray:
     return np.array(features, dtype=np.float32)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# AFib detection — heuristic screener over the day's IBI series.
+# Method: RR-interval variability statistics, no learned model required.
+# Documented thresholds (Tateno & Glass 2001, Lake & Moorman 2011).
+# Treat as a SCREENER, not a diagnostic: flags irregular rhythm patterns
+# consistent with AFib so the user knows to follow up with a clinician.
+# ─────────────────────────────────────────────────────────────────────
+
+def detect_afib(ibi_ms: list, beat_classes: list | None = None) -> dict:
+    """Heuristic AFib screen from a day's IBIs (and optionally per-beat labels).
+
+    Combines three classical markers:
+      • Coefficient of variation of RR intervals
+      • pNN50 — fraction of successive RR diffs > 50 ms
+      • Shannon entropy of the binned RR distribution
+
+    Optionally boosts confidence if recent ECG beats showed many S/V ectopics.
+    Returns a likelihood bucket + the raw numbers so the UI can show why.
+    """
+    valid = [int(x) for x in ibi_ms if isinstance(x, (int, float)) and 300 < x < 2000]
+    n = len(valid)
+
+    if n < 30:
+        return {
+            "likelihood": "insufficient_data",
+            "ibi_samples_used": n,
+            "notes": "Need at least 30 heartbeats with IBI data to screen for AFib.",
+        }
+
+    mean_rr = sum(valid) / n
+    var = sum((x - mean_rr) ** 2 for x in valid) / n
+    sd_rr = math.sqrt(var)
+    cv = sd_rr / mean_rr if mean_rr > 0 else 0
+
+    diffs = [abs(valid[i + 1] - valid[i]) for i in range(n - 1)]
+    nn50 = sum(1 for d in diffs if d > 50)
+    pnn50 = nn50 / len(diffs) * 100 if diffs else 0
+
+    # Shannon entropy of RR distribution binned at 50 ms resolution.
+    # AFib tends to have a flatter, more uniform RR distribution.
+    bin_width = 50
+    buckets: dict[int, int] = {}
+    for x in valid:
+        b = x // bin_width
+        buckets[b] = buckets.get(b, 0) + 1
+    entropy = 0.0
+    for cnt in buckets.values():
+        p = cnt / n
+        if p > 0:
+            entropy -= p * math.log2(p)
+
+    # Bucket the likelihood. Thresholds chosen to be conservative — moderate
+    # is common during exercise / stress / poor signal, high requires both
+    # CV and pNN50 to be clearly elevated.
+    high_irregularity = cv > 0.10 and pnn50 > 30
+    moderate_irregularity = cv > 0.06 or pnn50 > 25 or entropy > 2.4
+
+    if high_irregularity:
+        likelihood = "high"
+        notes = (
+            f"RR intervals are markedly irregular (CV {cv * 100:.1f}%, "
+            f"pNN50 {pnn50:.0f}%, entropy {entropy:.2f}). "
+            "This pattern is consistent with atrial fibrillation. "
+            "Consider showing this to a clinician — not a diagnosis."
+        )
+    elif moderate_irregularity:
+        likelihood = "moderate"
+        notes = (
+            f"Some irregularity detected (CV {cv * 100:.1f}%, "
+            f"pNN50 {pnn50:.0f}%). Could be normal variation, exercise, or "
+            "early arrhythmia signs — worth monitoring."
+        )
+    else:
+        likelihood = "low"
+        notes = (
+            f"RR intervals look regular (CV {cv * 100:.1f}%, "
+            f"pNN50 {pnn50:.0f}%). No AFib pattern detected."
+        )
+
+    # Boost if ECG beats showed lots of supraventricular/ventricular ectopy.
+    if beat_classes:
+        bc = [c for c in beat_classes if c]
+        if bc:
+            s_pct = sum(1 for c in bc if c == "S") / len(bc) * 100
+            v_pct = sum(1 for c in bc if c == "V") / len(bc) * 100
+            if (s_pct > 5 or v_pct > 5) and likelihood == "low":
+                likelihood = "moderate"
+                notes += (
+                    f" {s_pct:.0f}% of analyzed beats were supraventricular and "
+                    f"{v_pct:.0f}% were ventricular — adds some concern."
+                )
+
+    return {
+        "likelihood": likelihood,
+        "rr_cv": round(cv, 3),
+        "pnn50_percent": round(pnn50, 1),
+        "rr_entropy": round(entropy, 2),
+        "ibi_samples_used": n,
+        "notes": notes,
+        "method": "rr_variability_heuristic",
+    }
+
+
 def classify_ecg(samples_millivolts: list[float], sample_rate_hz: int = 500,
-                 model_name: str = "1D-CNN") -> dict:
+                 model_name: str = "XGBoost") -> dict:
     """
     Classify ECG recording into arrhythmia classes.
 
@@ -236,22 +334,7 @@ def classify_ecg(samples_millivolts: list[float], sample_rate_hz: int = 500,
     classifications = []
     summary = {c: 0 for c in CLASS_NAMES}
 
-    if model_name == "1D-CNN":
-        # Deep learning: input shape (N, 360, 1)
-        X = np.array(beats).reshape(-1, BEAT_WINDOW, 1)
-        probabilities = model.predict(X, verbose=0)
-        for i, probs in enumerate(probabilities):
-            pred_idx = int(np.argmax(probs))
-            pred_class = CLASS_NAMES[pred_idx]
-            summary[pred_class] += 1
-            classifications.append({
-                "beat_index": i,
-                "class": pred_class,
-                "class_name": CLASS_DESCRIPTIONS[pred_class],
-                "confidence": round(float(probs[pred_idx]) * 100, 1),
-                "probabilities": {CLASS_NAMES[j]: round(float(p) * 100, 1) for j, p in enumerate(probs)},
-            })
-    elif model_name in ("XGBoost", "SVM"):
+    if model_name in ("XGBoost", "SVM"):
         # Classical ML: extract features
         features = np.array([_extract_features(beat) for beat in beats])
         if model_name == "SVM" and _scaler is not None:

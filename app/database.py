@@ -576,48 +576,20 @@ def get_today_summary(watch_id: str) -> dict:
                 "hrv_rmssd_ms": hrv_rmssd,
             }
 
-        # ── Activity zones from accelerometer ────────────────────────
+        # ── Activity classification (still/walking/running/active) ───
         accel_rows = _fetchall(conn,
             "SELECT data_json FROM watch_sensor_data "
             "WHERE watch_id = ? AND sensor_type = 'accelerometer' AND created_at >= ?",
             (watch_id, today_start))
         activity_summary = None
         if accel_rows:
-            zones_sec = {"rest": 0, "light": 0, "moderate": 0, "intense": 0}
-            for r in accel_rows:
-                try:
-                    payload = json.loads(r["data_json"])
-                    samples = payload.get("samples", [])
-                    if len(samples) < 2:
-                        continue
-                    # Compute per-sample magnitude, then std-dev across the batch.
-                    # Std-dev is unit-relative (works for m/s² or g): low when still,
-                    # high during motion. Each batch ≈ 5 seconds of data.
-                    mags = []
-                    for s in samples:
-                        x = float(s.get("x", 0) or 0)
-                        y = float(s.get("y", 0) or 0)
-                        z = float(s.get("z", 0) or 0)
-                        mags.append((x * x + y * y + z * z) ** 0.5)
-                    mean = sum(mags) / len(mags)
-                    var = sum((m - mean) ** 2 for m in mags) / len(mags)
-                    sd = var ** 0.5
-                    if sd < 0.5:
-                        zones_sec["rest"] += 5
-                    elif sd < 2.0:
-                        zones_sec["light"] += 5
-                    elif sd < 5.0:
-                        zones_sec["moderate"] += 5
-                    else:
-                        zones_sec["intense"] += 5
-                except (json.JSONDecodeError, TypeError):
-                    continue
-
+            from .signal_analysis import aggregate_activity
+            activity_minutes = aggregate_activity(accel_rows) or {}
             batches = len(accel_rows)
             activity_summary = {
                 "accel_batches": batches,
                 "wear_time_estimate_min": round(batches * 5 / 60),
-                "zones_min": {k: round(v / 60) for k, v in zones_sec.items()},
+                "activity_minutes": activity_minutes,
             }
 
         # ── Latest SpO2 ──────────────────────────────────────────────
@@ -680,13 +652,45 @@ def get_today_summary(watch_id: str) -> dict:
                         "duration_hours": duration_h,
                         "started_at": sleep_row["start_time"],
                     }
+
+                    # Restlessness: re-use accelerometer rows that fall inside
+                    # this sleep window. Watch_sensor_data.created_at uses
+                    # 'YYYY-MM-DD HH:MM:SS' (UTC) — convert the sleep bounds
+                    # to the same shape for the SQL comparison.
+                    sleep_start_sql = start.astimezone().strftime("%Y-%m-%d %H:%M:%S") \
+                        if start.tzinfo else start.strftime("%Y-%m-%d %H:%M:%S")
+                    sleep_end_sql = end.astimezone().strftime("%Y-%m-%d %H:%M:%S") \
+                        if end.tzinfo else end.strftime("%Y-%m-%d %H:%M:%S")
+                    overnight_accel = _fetchall(conn,
+                        "SELECT data_json FROM watch_sensor_data "
+                        "WHERE watch_id = ? AND sensor_type = 'accelerometer' "
+                        "AND created_at >= ? AND created_at <= ?",
+                        (watch_id, sleep_start_sql, sleep_end_sql))
+                    if overnight_accel:
+                        from .signal_analysis import analyze_sleep_restlessness
+                        restlessness = analyze_sleep_restlessness(overnight_accel)
+                        if restlessness:
+                            sleep_summary["restlessness"] = restlessness
                 except (ValueError, AttributeError):
                     pass
+
+        # ── Rhythm screen (AFib heuristic) ───────────────────────────
+        rhythm_screen = None
+        if all_ibis:
+            from .ml_classifier import detect_afib
+            # Pull today's beat classifications (if any) to enrich the screen.
+            cls_rows = _fetchall(conn,
+                "SELECT predicted_class FROM ecg_classifications "
+                "WHERE watch_id = ? AND created_at >= ? LIMIT 500",
+                (watch_id, today_start))
+            beat_classes = [r["predicted_class"] for r in cls_rows] if cls_rows else None
+            rhythm_screen = detect_afib(all_ibis, beat_classes)
 
     return {
         "watch_id": watch_id,
         "date": today_start[:10],
         "heart_rate": hr_summary,
+        "rhythm_screen": rhythm_screen,
         "activity": activity_summary,
         "spo2": spo2_summary,
         "ecg": ecg_summary,
@@ -825,6 +829,12 @@ def get_history_summary(watch_id: str, days: int = 30) -> dict:
             except (json.JSONDecodeError, TypeError):
                 pass
 
+    # Aggregate AFib screen across all of the window's IBIs
+    rhythm_screen = None
+    if all_ibis:
+        from .ml_classifier import detect_afib
+        rhythm_screen = detect_afib(all_ibis, None)
+
     return {
         "watch_id": watch_id,
         "days_covered": days,
@@ -836,6 +846,7 @@ def get_history_summary(watch_id: str, days: int = 30) -> dict:
         "avg_sleep_hours": avg_sleep,
         "sleep_sessions_logged": sleep_count,
         "latest_spo2_percent": latest_spo2,
+        "rhythm_screen": rhythm_screen,
     }
 
 
