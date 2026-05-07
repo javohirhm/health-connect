@@ -229,14 +229,16 @@ def get_watch_today_summary(watch_id: str):
 
 
 @app.get("/api/v2/watch/{watch_id}/insights/total")
-def get_watch_total_insight(watch_id: str, days: int = 30):
-    """Holistic AI summary of the last `days` of data, cached daily."""
+def get_watch_total_insight(watch_id: str, days: int = 30, force: bool = False):
+    """Holistic AI summary of the last `days` of data, cached daily.
+    Pass ?force=true to skip the cache and regenerate (used by pull-to-refresh)."""
     today_date = datetime.utcnow().strftime("%Y-%m-%d")
     cache_key = f"total:{today_date}"
 
-    cached = db.get_cached_insight(watch_id, cache_key)
-    if cached:
-        return cached
+    if not force:
+        cached = db.get_cached_insight(watch_id, cache_key)
+        if cached:
+            return cached
 
     if not gemini.is_configured():
         return {
@@ -304,15 +306,16 @@ def chat_with_ai(watch_id: str, body: ChatRequest):
 
 
 @app.get("/api/v2/watch/{watch_id}/insights/ai")
-def get_watch_ai_insight(watch_id: str):
+def get_watch_ai_insight(watch_id: str, force: bool = False):
     """Natural-language summary of today's data via Gemini, cached by date."""
     summary = db.get_today_summary(watch_id)
     date = summary["date"]
 
-    # Cache hit?
-    cached = db.get_cached_insight(watch_id, date)
-    if cached:
-        return cached
+    # Cache hit (unless force=true)?
+    if not force:
+        cached = db.get_cached_insight(watch_id, date)
+        if cached:
+            return cached
 
     # Gemini disabled?
     if not gemini.is_configured():
