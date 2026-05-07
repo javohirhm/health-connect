@@ -286,13 +286,14 @@ def chat_with_ai(watch_id: str, body: ChatRequest):
             content="AI chat is not configured. Set GEMINI_API_KEY in the backend .env to enable.",
         )
 
-    today = db.get_today_summary(watch_id)
-    history = db.get_history_summary(watch_id, days=30)
+    # Pull comprehensive context — today + 30-day + steps + exercises +
+    # ECG distributions + latest on-demand measurements.
+    context = db.build_chat_context(watch_id)
 
     # Pydantic models → plain dicts for the gemini helper
     msgs = [{"role": m.role, "content": m.content} for m in body.messages]
 
-    text = gemini.generate_chat_response(today, history, msgs)
+    text = gemini.generate_chat_response(context, msgs)
     if not text:
         return ChatResponse(
             content="Sorry, the AI couldn't be reached right now. Try again in a minute.",

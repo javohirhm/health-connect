@@ -853,6 +853,115 @@ def get_history_summary(watch_id: str, days: int = 30) -> dict:
 
 # ── AI insights cache ─────────────────────────────────────────────────
 
+def build_chat_context(watch_id: str) -> dict:
+    """Comprehensive snapshot of the user's data for the AI chat.
+
+    Returned dict is injected as a system instruction so Gemini can answer
+    *any* question grounded in the actual numbers — today's steps, last
+    week's exercises, individual ECG beat distributions, latest SpO2 / BIA /
+    skin temp readings, sleep history, etc.
+
+    Cap: ~5–10 KB of JSON, well within Gemini's context window.
+    """
+    today = get_today_summary(watch_id)
+    history = get_history_summary(watch_id, days=30)
+
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    seven_days_ago = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+
+    steps_today = 0
+    steps_by_day: dict[str, int] = {}
+    exercises_recent: list[dict] = []
+    ecg_recent: list[dict] = []
+    latest_measurements: dict = {}
+
+    with get_db() as conn:
+        # Find the device that owns this watch (Health Connect data is keyed by device_id)
+        dev_row = _fetchone(conn,
+            "SELECT device_id FROM watch_sensor_data "
+            "WHERE watch_id = ? ORDER BY id DESC LIMIT 1",
+            (watch_id,))
+
+        if dev_row:
+            device_id = dev_row["device_id"]
+
+            # ── Steps (Health Connect data) ─────────────────────────
+            steps_rows = _fetchall(conn,
+                "SELECT start_time, count FROM steps "
+                "WHERE device_id = ? AND start_time >= ? "
+                "ORDER BY start_time DESC LIMIT 200",
+                (device_id, seven_days_ago))
+            for r in steps_rows:
+                try:
+                    day = str(r["start_time"])[:10]
+                    steps_by_day[day] = steps_by_day.get(day, 0) + int(r["count"] or 0)
+                except (ValueError, TypeError, KeyError):
+                    continue
+            steps_today = steps_by_day.get(today_str, 0)
+
+            # ── Exercise sessions (last 7 days) ─────────────────────
+            ex_rows = _fetchall(conn,
+                "SELECT start_time, end_time, exercise_type FROM exercise_sessions "
+                "WHERE device_id = ? AND start_time >= ? "
+                "ORDER BY start_time DESC LIMIT 20",
+                (device_id, seven_days_ago))
+            for r in ex_rows:
+                try:
+                    s = datetime.fromisoformat(str(r["start_time"]).replace("Z", "+00:00"))
+                    e = datetime.fromisoformat(str(r["end_time"]).replace("Z", "+00:00"))
+                    duration_min = round((e - s).total_seconds() / 60)
+                    exercises_recent.append({
+                        "started_at": str(r["start_time"]),
+                        "duration_minutes": duration_min,
+                        "exercise_type_code": int(r["exercise_type"] or 0),
+                    })
+                except (ValueError, AttributeError, TypeError):
+                    continue
+
+        # ── Recent ECGs with their classification distribution ──────
+        latest_ecgs = _fetchall(conn,
+            "SELECT id, created_at FROM watch_sensor_data "
+            "WHERE watch_id = ? AND sensor_type = 'ecg' "
+            "ORDER BY id DESC LIMIT 5",
+            (watch_id,))
+        for ecg in latest_ecgs:
+            cls_rows = _fetchall(conn,
+                "SELECT predicted_class, COUNT(*) as c FROM ecg_classifications "
+                "WHERE ecg_record_id = ? GROUP BY predicted_class",
+                (ecg["id"],))
+            ecg_recent.append({
+                "id": ecg["id"],
+                "recorded_at": str(ecg["created_at"]),
+                "beat_distribution": {r["predicted_class"]: r["c"] for r in cls_rows},
+            })
+
+        # ── Latest on-demand measurements ───────────────────────────
+        for sensor_type in ("spo2", "bia", "skin_temp"):
+            row = _fetchone(conn,
+                "SELECT data_json, created_at FROM watch_sensor_data "
+                "WHERE watch_id = ? AND sensor_type = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (watch_id, sensor_type))
+            if row:
+                try:
+                    latest_measurements[sensor_type] = {
+                        "data": json.loads(row["data_json"]),
+                        "recorded_at": str(row["created_at"]),
+                    }
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+    return {
+        "today": today,
+        "last_30_days_summary": history,
+        "steps_today": steps_today,
+        "steps_last_7_days_by_date": steps_by_day,
+        "exercise_sessions_last_7_days": exercises_recent,
+        "recent_ecg_recordings": ecg_recent,
+        "latest_on_demand_measurements": latest_measurements,
+    }
+
+
 def get_sleep_history(watch_id: str, limit: int = 14) -> list[dict]:
     """Recent sleep sessions for the device paired with this watch, each
     augmented with a restlessness analysis from accelerometer batches inside
