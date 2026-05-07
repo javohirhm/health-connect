@@ -197,17 +197,100 @@ def _extract_features(beat: np.ndarray) -> np.ndarray:
 # consistent with AFib so the user knows to follow up with a clinician.
 # ─────────────────────────────────────────────────────────────────────
 
+# Lazy-loaded trained AFib model (set on first call)
+_afib_bundle: dict | None = None
+_afib_load_attempted = False
+
+
+def _load_afib_model() -> dict | None:
+    """Load the trained AFib classifier if present. Cached after first call."""
+    global _afib_bundle, _afib_load_attempted
+    if _afib_load_attempted:
+        return _afib_bundle
+    _afib_load_attempted = True
+    try:
+        import joblib
+        path = Path(config.MODELS_DIR) / "afib_classifier.pkl"
+        if path.exists():
+            _afib_bundle = joblib.load(str(path))
+            logger.info("Loaded trained AFib model from %s", path)
+        else:
+            logger.info("No trained AFib model at %s — using heuristic", path)
+    except Exception as e:
+        logger.warning("Failed to load trained AFib model: %s", e)
+    return _afib_bundle
+
+
+def _afib_features_from_ibis(rr: np.ndarray) -> np.ndarray | None:
+    """Match the 12-feature vector emitted by training/train_afib.py."""
+    rr = rr[(rr > 300) & (rr < 2000)]
+    if rr.size < 10:
+        return None
+    mean_rr = float(np.mean(rr))
+    sd_rr = float(np.std(rr))
+    cv = sd_rr / mean_rr if mean_rr > 0 else 0.0
+    diffs = np.abs(np.diff(rr))
+    pnn50 = float(np.mean(diffs > 50)) * 100.0 if diffs.size else 0.0
+    rmssd = float(np.sqrt(np.mean(diffs ** 2))) if diffs.size else 0.0
+    bins = np.bincount((rr // 50).astype(int))
+    p = bins[bins > 0] / rr.size
+    entropy = float(-(p * np.log2(p)).sum())
+    median_rr = float(np.median(rr))
+    short_ratio = float(np.mean(rr < 0.85 * median_rr))
+    long_ratio = float(np.mean(rr > 1.15 * median_rr))
+    norm_sd = float(np.std(diffs / mean_rr)) if mean_rr > 0 else 0.0
+    centered = rr - mean_rr
+    skew = float(np.mean(centered ** 3) / (sd_rr ** 3 + 1e-9))
+    kurt = float(np.mean(centered ** 4) / (sd_rr ** 4 + 1e-9))
+    return np.array([
+        mean_rr, sd_rr, cv, pnn50, rmssd, entropy,
+        short_ratio, long_ratio, norm_sd, skew, kurt, float(rr.size),
+    ], dtype=np.float32).reshape(1, -1)
+
+
 def detect_afib(ibi_ms: list, beat_classes: list | None = None) -> dict:
-    """Heuristic AFib screen from a day's IBIs (and optionally per-beat labels).
+    """AFib screen.
 
-    Combines three classical markers:
-      • Coefficient of variation of RR intervals
-      • pNN50 — fraction of successive RR diffs > 50 ms
-      • Shannon entropy of the binned RR distribution
-
-    Optionally boosts confidence if recent ECG beats showed many S/V ectopics.
-    Returns a likelihood bucket + the raw numbers so the UI can show why.
+    Uses the trained XGBoost model (training/train_afib.py) when present,
+    falls back to the documented Tateno & Glass heuristic otherwise. The
+    response always includes a `method` field so the UI can tell which
+    path produced the answer.
     """
+    bundle = _load_afib_model()
+    if bundle is not None:
+        valid = [int(x) for x in ibi_ms if isinstance(x, (int, float)) and 300 < x < 2000]
+        if len(valid) >= 30:
+            feats = _afib_features_from_ibis(np.asarray(valid, dtype=np.float32))
+            if feats is not None:
+                try:
+                    proba = bundle["model"].predict_proba(feats)[0]
+                    afib_p = float(proba[1])
+                    if afib_p > 0.7:
+                        likelihood = "high"
+                        notes = (
+                            f"Model classifies this rhythm as atrial fibrillation "
+                            f"(probability {afib_p:.0%}). Consider showing a clinician."
+                        )
+                    elif afib_p > 0.4:
+                        likelihood = "moderate"
+                        notes = (
+                            f"Some AFib features detected (probability {afib_p:.0%}). "
+                            "Worth monitoring."
+                        )
+                    else:
+                        likelihood = "low"
+                        notes = f"Rhythm classified as not-AFib (probability {afib_p:.0%})."
+                    return {
+                        "likelihood": likelihood,
+                        "afib_probability": round(afib_p, 3),
+                        "ibi_samples_used": len(valid),
+                        "notes": notes,
+                        "method": bundle.get("method_tag", "trained_xgboost"),
+                    }
+                except Exception as e:
+                    logger.warning("Trained AFib inference failed, falling back: %s", e)
+
+    # ── Heuristic fallback ─────────────────────────────────────────────
     valid = [int(x) for x in ibi_ms if isinstance(x, (int, float)) and 300 < x < 2000]
     n = len(valid)
 
