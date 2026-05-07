@@ -13,3 +13,6 @@ package-lock.json
 
 # Large model files (>50MB) - transfer via SCP
 models/Random_Forest.pkl
+training/datasets/
+training/.venv/
+training/__pycache__/
