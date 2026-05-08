@@ -187,6 +187,16 @@ CREATE TABLE IF NOT EXISTS ai_insights (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ai_insights_watch ON ai_insights(watch_id, date);
+
+CREATE TABLE IF NOT EXISTS users (
+    device_id   TEXT PRIMARY KEY,
+    name        TEXT NOT NULL DEFAULT '',
+    email       TEXT NOT NULL DEFAULT '',
+    height_cm   INTEGER,
+    weight_kg   INTEGER,
+    age         INTEGER,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 _PG_SCHEMA = """
@@ -282,6 +292,16 @@ CREATE TABLE IF NOT EXISTS ai_insights (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ai_insights_watch ON ai_insights(watch_id, date);
+
+CREATE TABLE IF NOT EXISTS users (
+    device_id   TEXT PRIMARY KEY,
+    name        TEXT NOT NULL DEFAULT '',
+    email       TEXT NOT NULL DEFAULT '',
+    height_cm   INTEGER,
+    weight_kg   INTEGER,
+    age         INTEGER,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 """
 
 
@@ -1025,6 +1045,119 @@ def get_cached_insight(watch_id: str, date: str) -> dict | None:
         "model": row["model"],
         "generated_at": str(row["created_at"]),
         "cached": True,
+    }
+
+
+# ── User profile ──────────────────────────────────────────────────────
+
+def get_user(device_id: str) -> dict | None:
+    with get_db() as conn:
+        return _fetchone(conn, "SELECT * FROM users WHERE device_id = ?", (device_id,))
+
+
+def upsert_user(device_id: str, name: str, email: str,
+                height_cm: int | None, weight_kg: int | None, age: int | None) -> dict:
+    """Create or update a user profile. Returns the resulting row."""
+    now = datetime.utcnow().isoformat()
+    with get_db() as conn:
+        if config.DB_TYPE == "postgresql":
+            _execute(conn,
+                "INSERT INTO users (device_id, name, email, height_cm, weight_kg, age, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, NOW()) "
+                "ON CONFLICT (device_id) DO UPDATE SET "
+                "name = EXCLUDED.name, email = EXCLUDED.email, "
+                "height_cm = EXCLUDED.height_cm, weight_kg = EXCLUDED.weight_kg, "
+                "age = EXCLUDED.age, updated_at = NOW()",
+                (device_id, name, email, height_cm, weight_kg, age))
+        else:
+            _execute(conn,
+                "INSERT OR REPLACE INTO users "
+                "(device_id, name, email, height_cm, weight_kg, age, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (device_id, name, email, height_cm, weight_kg, age, now))
+        return _fetchone(conn, "SELECT * FROM users WHERE device_id = ?", (device_id,))
+
+
+def get_performance_records(device_id: str) -> dict:
+    """Aggregate "personal best" records across this user's watch data.
+
+    All-time max BPM, longest ECG recording, best (highest) SpO2, and total
+    on-demand sessions (ECG + SpO2 + BIA + skin_temp). Returns 0/None for any
+    metric that has no data yet.
+    """
+    with get_db() as conn:
+        # Find the watch(es) that belong to this device.
+        watch_rows = _fetchall(conn,
+            "SELECT DISTINCT watch_id FROM watch_sensor_data WHERE device_id = ?",
+            (device_id,))
+        watch_ids = [r["watch_id"] for r in watch_rows]
+        if not watch_ids:
+            return {
+                "max_heart_rate_bpm": 0, "longest_ecg_seconds": 0,
+                "best_spo2_percent": 0, "total_sessions": 0,
+            }
+
+        placeholders = ",".join("?" * len(watch_ids))
+
+        # Max BPM — scan every HR batch and pull the highest sample.
+        hr_rows = _fetchall(conn,
+            f"SELECT data_json FROM watch_sensor_data "
+            f"WHERE watch_id IN ({placeholders}) AND sensor_type = 'heart_rate'",
+            tuple(watch_ids))
+        max_bpm = 0
+        for r in hr_rows:
+            try:
+                payload = json.loads(r["data_json"])
+                for s in payload.get("samples", []):
+                    bpm = s.get("bpm")
+                    if isinstance(bpm, (int, float)) and bpm > max_bpm:
+                        max_bpm = int(bpm)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        # Longest ECG — duration in seconds (samples / sampleRate).
+        ecg_rows = _fetchall(conn,
+            f"SELECT data_json FROM watch_sensor_data "
+            f"WHERE watch_id IN ({placeholders}) AND sensor_type = 'ecg'",
+            tuple(watch_ids))
+        longest_ecg_s = 0
+        for r in ecg_rows:
+            try:
+                d = json.loads(r["data_json"])
+                samples = d.get("samplesMillivolts", [])
+                rate = d.get("sampleRateHz", 500) or 500
+                duration = len(samples) / rate
+                if duration > longest_ecg_s:
+                    longest_ecg_s = duration
+            except (json.JSONDecodeError, TypeError, ZeroDivisionError):
+                continue
+
+        # Best SpO2 — highest reading on record.
+        spo2_rows = _fetchall(conn,
+            f"SELECT data_json FROM watch_sensor_data "
+            f"WHERE watch_id IN ({placeholders}) AND sensor_type = 'spo2'",
+            tuple(watch_ids))
+        best_spo2 = 0
+        for r in spo2_rows:
+            try:
+                v = json.loads(r["data_json"]).get("spO2Percent", 0)
+                if isinstance(v, (int, float)) and v > best_spo2:
+                    best_spo2 = int(v)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        # Total on-demand sessions across ECG / SpO2 / BIA / skin_temp.
+        total_sessions = _fetchone(conn,
+            f"SELECT COUNT(*) as c FROM watch_sensor_data "
+            f"WHERE watch_id IN ({placeholders}) "
+            f"AND sensor_type IN ('ecg', 'spo2', 'bia', 'skin_temp')",
+            tuple(watch_ids))["c"]
+
+    return {
+        "max_heart_rate_bpm": max_bpm,
+        "longest_ecg_seconds": round(longest_ecg_s, 1),
+        "best_spo2_percent": best_spo2,
+        "total_sessions": total_sessions,
     }
 
 

@@ -111,3 +111,30 @@ class ChatResponse(BaseModel):
     role: str = "assistant"
     content: str
     model: str = ""
+
+
+# ── User profile ─────────────────────────────────────────────────────
+
+class UserProfile(BaseModel):
+    device_id: str
+    name: str = ""
+    email: str = ""
+    height_cm: Optional[int] = Field(None, ge=50, le=260)
+    weight_kg: Optional[int] = Field(None, ge=20, le=400)
+    age: Optional[int] = Field(None, ge=1, le=130)
+
+
+class UserProfileUpdate(BaseModel):
+    """Fields the client can change. device_id comes from the URL, not the body."""
+    name: str = ""
+    email: str = ""
+    height_cm: Optional[int] = Field(None, ge=50, le=260)
+    weight_kg: Optional[int] = Field(None, ge=20, le=400)
+    age: Optional[int] = Field(None, ge=1, le=130)
+
+
+class PerformanceRecords(BaseModel):
+    max_heart_rate_bpm: int = 0
+    longest_ecg_seconds: float = 0
+    best_spo2_percent: int = 0
+    total_sessions: int = 0

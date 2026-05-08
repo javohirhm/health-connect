@@ -22,6 +22,7 @@ from .models import (
     HealthDataPayload, SyncResponse, DeviceSummary, HealthSummary,
     WatchSensorPayload, WatchSyncResponse,
     ChatRequest, ChatResponse,
+    UserProfile, UserProfileUpdate, PerformanceRecords,
 )
 from . import database as db
 from . import gemini
@@ -105,6 +106,35 @@ def get_exercise(device_id: str, limit: int = 50):
 @app.get("/api/v1/health")
 def health_check():
     return {"status": "ok", "db_type": config.DB_TYPE}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# User Profile
+# ═══════════════════════════════════════════════════════════════════════
+
+@app.get("/api/v1/users/{device_id}", response_model=UserProfile)
+def get_user_profile(device_id: str):
+    """Fetch a user's profile. Auto-creates an empty record on first read so
+    the client always gets a 200 (the Profile screen would otherwise need to
+    handle 404 for a brand-new install)."""
+    row = db.get_user(device_id)
+    if not row:
+        row = db.upsert_user(device_id, name="", email="",
+                             height_cm=None, weight_kg=None, age=None)
+    return UserProfile(**row)
+
+
+@app.put("/api/v1/users/{device_id}", response_model=UserProfile)
+def update_user_profile(device_id: str, body: UserProfileUpdate):
+    row = db.upsert_user(device_id, name=body.name, email=body.email,
+                         height_cm=body.height_cm, weight_kg=body.weight_kg,
+                         age=body.age)
+    return UserProfile(**row)
+
+
+@app.get("/api/v1/users/{device_id}/performance-records", response_model=PerformanceRecords)
+def get_user_performance_records(device_id: str):
+    return PerformanceRecords(**db.get_performance_records(device_id))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -446,6 +476,23 @@ def get_watch_latest_bia(watch_id: str):
             "skeletal_muscle_percent": data.get("skeletalMusclePercent", 0),
             "basal_metabolic_rate": data.get("basalMetabolicRate", 0),
             "watch_id": watch_id, "recorded_at": rows[0]["created_at"]}
+
+
+@app.get("/api/v2/watch/{watch_id}/battery/latest")
+def get_watch_latest_battery(watch_id: str):
+    rows = db.get_watch_sensor_data(watch_id, "battery", 1)
+    if not rows:
+        raise HTTPException(404, "No battery data")
+    try:
+        data = json.loads(rows[0]["data_json"])
+        return {
+            "percent": int(data.get("percent", 0)),
+            "charging": bool(data.get("charging", False)),
+            "watch_id": watch_id,
+            "recorded_at": rows[0]["created_at"],
+        }
+    except (json.JSONDecodeError, ValueError, TypeError):
+        raise HTTPException(500, "Could not parse battery data")
 
 
 @app.get("/api/v2/watch/{watch_id}/skin-temp/latest")
